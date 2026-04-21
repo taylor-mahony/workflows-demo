@@ -22,9 +22,17 @@ type AudienceProfile = {
   localConcerns: string[];
 };
 
+type WeatherData = {
+  temperatureF: number;
+  windSpeedMph: number;
+  humidity: number;
+  condition: string;
+};
+
 type BroadcastDraft = {
   locationContext: LocationContext;
   audienceProfile: AudienceProfile;
+  weather: WeatherData;
   headlines: string[];
   script: string;
   callToAction: string;
@@ -80,7 +88,71 @@ const analyzeLocation = task(
 );
 
 // ---------------------------------------------------------------------------
-// Task 2a — Generate geo-relevant headlines (parallel branch A)
+// WMO weather code → human-readable condition
+// https://open-meteo.com/en/docs#weathervariables
+// ---------------------------------------------------------------------------
+
+function wmoCondition(code: number): string {
+  if (code === 0) return "clear sky";
+  if (code <= 3) return "partly cloudy";
+  if (code <= 48) return "foggy";
+  if (code <= 55) return "drizzling";
+  if (code <= 65) return "rainy";
+  if (code <= 75) return "snowy";
+  if (code <= 82) return "rain showers";
+  if (code <= 86) return "snow showers";
+  if (code <= 99) return "thunderstorms";
+  return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Task 2a — Fetch live weather from Open-Meteo (no API key required)
+// ---------------------------------------------------------------------------
+
+const fetchWeather = task(
+  { name: "fetchWeather" },
+  async function fetchWeather(lat: number, lng: number): Promise<WeatherData> {
+    console.log(`[fetchWeather] Fetching weather for (${lat}, ${lng})`);
+
+    const url =
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${lat}&longitude=${lng}` +
+      `&current=temperature_2m,wind_speed_10m,relative_humidity_2m,weather_code` +
+      `&temperature_unit=fahrenheit&wind_speed_unit=mph`;
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`Open-Meteo request failed: ${res.status} ${res.statusText}`);
+    }
+
+    const data = (await res.json()) as {
+      current: {
+        temperature_2m: number;
+        wind_speed_10m: number;
+        relative_humidity_2m: number;
+        weather_code: number;
+      };
+    };
+
+    const current = data.current;
+    const weather: WeatherData = {
+      temperatureF: Math.round(current.temperature_2m),
+      windSpeedMph: Math.round(current.wind_speed_10m),
+      humidity: Math.round(current.relative_humidity_2m),
+      condition: wmoCondition(current.weather_code),
+    };
+
+    console.log(
+      `[fetchWeather] ${weather.condition}, ${weather.temperatureF}°F, ` +
+        `wind ${weather.windSpeedMph}mph, humidity ${weather.humidity}%`,
+    );
+
+    return weather;
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Task 2b — Generate geo-relevant headlines (parallel branch B)
 // ---------------------------------------------------------------------------
 
 const generateHeadlines = task(
@@ -114,7 +186,7 @@ const generateHeadlines = task(
 );
 
 // ---------------------------------------------------------------------------
-// Task 2b — Profile the target audience (parallel branch B)
+// Task 2c — Profile the target audience (parallel branch C)
 // ---------------------------------------------------------------------------
 
 const assessAudience = task(
@@ -164,8 +236,13 @@ const composeBroadcast = task(
     ctx: LocationContext,
     headlines: string[],
     audience: AudienceProfile,
+    weather: WeatherData,
   ): Promise<BroadcastDraft> {
-    console.log(`[composeBroadcast] audience=${audience.primarySegment}`);
+    console.log(`[composeBroadcast] audience=${audience.primarySegment}, weather=${weather.condition}`);
+
+    const weatherLine =
+      `Current conditions: ${weather.condition}, ${weather.temperatureF}°F, ` +
+      `wind ${weather.windSpeedMph}mph, humidity ${weather.humidity}%.`;
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -174,15 +251,19 @@ const composeBroadcast = task(
           role: "system",
           content:
             `You are a broadcast writer for a geo-targeted local content platform. ` +
-            `Write in a ${audience.tone} tone for ${audience.primarySegment}.`,
+            `Write in a ${audience.tone} tone for ${audience.primarySegment}. ` +
+            `Weave the live weather conditions naturally into the story — ` +
+            `let them influence the mood, urgency, and advice in the script.`,
         },
         {
           role: "user",
           content:
             `Location: ${ctx.summary}\n` +
+            `${weatherLine}\n` +
             `Headlines to cover: ${headlines.join(" | ")}\n` +
             `Audience concerns: ${audience.localConcerns.join(", ")}\n\n` +
-            "Write a 3-paragraph broadcast script that weaves the headlines into a coherent local story. " +
+            "Write a 3-paragraph broadcast script that weaves the headlines and live weather " +
+            "into a coherent local story. The weather should feel integral, not bolted on. " +
             "Return a JSON object with: " +
             '"script" (the 3-paragraph text), ' +
             '"callToAction" (one closing sentence prompting the audience to act or stay informed), ' +
@@ -197,6 +278,7 @@ const composeBroadcast = task(
     return {
       locationContext: ctx,
       audienceProfile: audience,
+      weather,
       headlines,
       script: parsed.script ?? "",
       callToAction: parsed.callToAction ?? "",
@@ -243,7 +325,8 @@ const refineBroadcast = task(
 
 // ---------------------------------------------------------------------------
 // Orchestrating task — entry point for the full geocast pipeline
-// analyzeLocation → [generateHeadlines ∥ assessAudience] → composeBroadcast → refineBroadcast
+// analyzeLocation → [fetchWeather ∥ generateHeadlines ∥ assessAudience]
+//   → composeBroadcast → refineBroadcast
 // ---------------------------------------------------------------------------
 
 task(
@@ -259,17 +342,19 @@ task(
     const locationContext = await analyzeLocation(lat, lng, radiusKm);
     console.log(`[orchestrateGeocast] Location ready: ${locationContext.summary}`);
 
-    // Step 2 — parallel: generate headlines and profile the audience
-    const [headlines, audienceProfile] = await Promise.all([
+    // Step 2 — parallel: live weather + headlines + audience profile
+    const [weather, headlines, audienceProfile] = await Promise.all([
+      fetchWeather(lat, lng),
       generateHeadlines(locationContext),
       assessAudience(locationContext),
     ]);
     console.log(
-      `[orchestrateGeocast] ${headlines.length} headlines, audience: ${audienceProfile.primarySegment}`,
+      `[orchestrateGeocast] Weather: ${weather.condition} ${weather.temperatureF}°F | ` +
+        `${headlines.length} headlines | audience: ${audienceProfile.primarySegment}`,
     );
 
-    // Step 3 — compose the broadcast from merged context
-    const draft = await composeBroadcast(locationContext, headlines, audienceProfile);
+    // Step 3 — compose the broadcast from all merged context
+    const draft = await composeBroadcast(locationContext, headlines, audienceProfile, weather);
     console.log(`[orchestrateGeocast] Draft ready (~${draft.estimatedReadTimeSecs}s)`);
 
     // Step 4 — refine and return the final script
